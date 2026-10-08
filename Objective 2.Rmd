@@ -1,0 +1,757 @@
+---
+title: "Objective 2: Socioeconomic Inequalities in Smoking"
+author: "Jesca"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Objective
+
+This analysis assesses socioeconomic inequalities in three smoking outcomes:
+
+1. Daily smoking
+2. Current smoking
+3. Ever smoking
+
+Daily smoking intensity is excluded from Objective 2 because of substantial missingness. Socioeconomic position is represented by education, household income, employment status, and occupational class. Subjective income feeling is treated as an adjustment covariate, not as a socioeconomic exposure.
+
+For each smoking outcome, unadjusted and sequentially adjusted multilevel Poisson regression models are fitted to estimate prevalence ratios (PRs). Models include a random intercept for country and use the analysis weight `anweight`.
+
+# Packages
+
+```{r load-packages}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(forcats)
+library(stringr)
+library(tibble)
+
+library(glmmTMB)
+library(broom.mixed)
+
+library(gt)
+library(ggplot2)
+```
+
+# Load Data
+
+```{r load-data}
+data_path <- dplyr::case_when(
+  file.exists("ess_clean.rds") ~ "ess_clean.rds",
+  file.exists("../ess_clean.rds") ~ "../ess_clean.rds",
+  TRUE ~ NA_character_
+)
+
+if (is.na(data_path)) {
+  stop("Could not find ess_clean.rds in the working directory or parent directory.")
+}
+
+ess_clean <- readRDS(data_path)
+
+cat("Data loaded successfully.\n")
+cat("Sample size:", nrow(ess_clean), "respondents\n")
+cat("Variables:", ncol(ess_clean), "\n")
+```
+
+# Prepare Analysis Data
+
+Reference groups are set so that higher socioeconomic position is the comparison category for each SES marker. For covariates, the first factor level is the reference category.
+
+```{r prepare-data}
+ess_ml_data <- ess_clean %>%
+  mutate(
+    Daily_smoker = as.numeric(Daily_smoker),
+    current_smoking = as.numeric(current_smoking),
+    ever_smoking = as.numeric(ever_smoking),
+
+    survey_year = factor(survey_year, levels = c("2014", "2023")),
+    cntry = factor(cntry),
+
+    education = factor(education, levels = c("High", "Medium", "Low")),
+    income_group = factor(income_group, levels = c("High", "Middle", "Low")),
+    employment = factor(
+      employment,
+      levels = c("Employed", "Inactive (other)", "Retired", "Unemployed")
+    ),
+    occupation = factor(
+      occupation,
+      levels = c("Non-manual (higher)", "Non-manual (lower)", "Manual")
+    ),
+
+    income_feeling = factor(
+      income_feeling,
+      levels = c("Living comfortably", "Coping", "Difficult / very difficult")
+    ),
+    sex = factor(sex, levels = c("Male", "Female")),
+    marital = factor(
+      marital,
+      levels = c("Married/Civil union", "Never married", "Separated/Divorced", "Widowed")
+    ),
+    agea = as.numeric(agea),
+    anweight = as.numeric(anweight)
+  )
+```
+
+## Reference Categories
+
+```{r check-reference-categories}
+reference_verification <- tibble(
+  Variable = c(
+    "Education",
+    "Household income",
+    "Employment status",
+    "Occupational class",
+    "Subjective income feeling",
+    "Sex",
+    "Marital status",
+    "Survey year"
+  ),
+  Role = c(
+    "SES exposure",
+    "SES exposure",
+    "SES exposure",
+    "SES exposure",
+    "Covariate",
+    "Covariate",
+    "Covariate",
+    "Covariate"
+  ),
+  Reference_Category = c(
+    levels(ess_ml_data$education)[1],
+    levels(ess_ml_data$income_group)[1],
+    levels(ess_ml_data$employment)[1],
+    levels(ess_ml_data$occupation)[1],
+    levels(ess_ml_data$income_feeling)[1],
+    levels(ess_ml_data$sex)[1],
+    levels(ess_ml_data$marital)[1],
+    levels(ess_ml_data$survey_year)[1]
+  )
+)
+
+reference_verification
+```
+
+# Define Analysis Variables
+
+```{r define-analysis-variables}
+obj2_outcomes <- tribble(
+  ~outcome,          ~outcome_label,
+  "Daily_smoker",    "Daily smoking",
+  "current_smoking", "Current smoking",
+  "ever_smoking",    "Ever smoking"
+)
+
+obj2_ses <- tribble(
+  ~var,           ~label,                ~reference,
+  "education",    "Education level",     "High",
+  "income_group", "Household income",    "High",
+  "employment",   "Employment status",   "Employed",
+  "occupation",   "Occupational class",  "Non-manual (higher)"
+)
+
+core_covariates <- c("agea", "sex", "marital", "income_feeling")
+
+obj2_outcomes
+obj2_ses
+```
+
+# Missing Data Overview
+
+```{r missing-data-overview}
+analysis_vars <- c(
+  obj2_outcomes$outcome,
+  obj2_ses$var,
+  core_covariates,
+  "survey_year",
+  "cntry",
+  "anweight"
+)
+
+missing_summary <- ess_ml_data %>%
+  summarise(across(all_of(analysis_vars), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_n") %>%
+  mutate(
+    Missing_percent = 100 * Missing_n / nrow(ess_ml_data)
+  ) %>%
+  arrange(desc(Missing_percent))
+
+missing_summary
+```
+
+# Modelling Functions
+
+```{r model-functions}
+fit_ml_poisson <- function(data, outcome, formula_rhs, needed_vars) {
+  model_vars <- unique(c(outcome, needed_vars, "cntry", "anweight"))
+
+  model_data <- data %>%
+    filter(if_all(all_of(model_vars), ~ !is.na(.x))) %>%
+    filter(anweight > 0)
+
+  if (nrow(model_data) == 0 || n_distinct(model_data[[outcome]]) < 2) {
+    return(NULL)
+  }
+
+  model_formula <- as.formula(
+    paste0(outcome, " ~ ", formula_rhs, " + (1 | cntry)")
+  )
+
+  tryCatch(
+    glmmTMB(
+      formula = model_formula,
+      family = poisson(link = "log"),
+      weights = anweight,
+      data = model_data,
+      REML = FALSE
+    ),
+    error = function(e) {
+      warning(
+        "Model failed for: ", outcome, " ~ ", formula_rhs,
+        "\nError: ", conditionMessage(e)
+      )
+      NULL
+    }
+  )
+}
+
+tidy_ml_poisson <- function(fit, outcome_label, model_type, model_label) {
+  if (is.null(fit)) {
+    return(tibble())
+  }
+
+  tidy(
+    fit,
+    effects = "fixed",
+    conf.int = TRUE,
+    conf.method = "wald",
+    exponentiate = TRUE
+  ) %>%
+    filter(term != "(Intercept)") %>%
+    transmute(
+      Outcome = outcome_label,
+      model_type = model_type,
+      model_label = model_label,
+      term_raw = term,
+      PR = estimate,
+      CI_low = conf.low,
+      CI_high = conf.high,
+      p_value = p.value
+    )
+}
+
+decode_terms <- function(results) {
+  results %>%
+    mutate(
+      Variable = case_when(
+        str_detect(term_raw, "^education") ~ "Education level",
+        str_detect(term_raw, "^income_group") ~ "Household income",
+        str_detect(term_raw, "^employment") ~ "Employment status",
+        str_detect(term_raw, "^occupation") ~ "Occupational class",
+        str_detect(term_raw, "^income_feeling") ~ "Subjective income feeling",
+        term_raw == "agea" ~ "Age",
+        str_detect(term_raw, "^sex") ~ "Sex",
+        str_detect(term_raw, "^marital") ~ "Marital status",
+        str_detect(term_raw, "^survey_year") ~ "Survey year",
+        TRUE ~ term_raw
+      ),
+      Level = case_when(
+        str_detect(term_raw, "^education") ~ str_remove(term_raw, "^education"),
+        str_detect(term_raw, "^income_group") ~ str_remove(term_raw, "^income_group"),
+        str_detect(term_raw, "^employment") ~ str_remove(term_raw, "^employment"),
+        str_detect(term_raw, "^occupation") ~ str_remove(term_raw, "^occupation"),
+        str_detect(term_raw, "^income_feeling") ~ str_remove(term_raw, "^income_feeling"),
+        term_raw == "agea" ~ "Per one-year increase",
+        str_detect(term_raw, "^sex") ~ str_remove(term_raw, "^sex"),
+        str_detect(term_raw, "^marital") ~ str_remove(term_raw, "^marital"),
+        str_detect(term_raw, "^survey_year") ~ str_remove(term_raw, "^survey_year"),
+        TRUE ~ term_raw
+      ),
+      PR_CI = sprintf("%.2f (%.2f-%.2f)", PR, CI_low, CI_high),
+      p_fmt = case_when(
+        is.na(p_value) ~ NA_character_,
+        p_value < 0.001 ~ "<0.001",
+        TRUE ~ sprintf("%.3f", p_value)
+      )
+    )
+}
+
+keep_exposure_terms <- function(results) {
+  results %>%
+    decode_terms() %>%
+    filter(
+      case_when(
+        Variable == "Education level" ~ exposure_var == "education",
+        Variable == "Household income" ~ exposure_var == "income_group",
+        Variable == "Employment status" ~ exposure_var == "employment",
+        Variable == "Occupational class" ~ exposure_var == "occupation",
+        TRUE ~ FALSE
+      )
+    )
+}
+```
+
+# Unadjusted Models
+
+Each unadjusted model includes one SES marker and a country-level random intercept.
+
+```{r unadjusted-models}
+obj2_upr_results <- tidyr::expand_grid(
+  obj2_outcomes,
+  obj2_ses
+) %>%
+  pmap_dfr(function(outcome, outcome_label, var, label, reference) {
+    data_tmp <- ess_ml_data %>%
+      mutate("{var}" := fct_relevel(factor(.data[[var]]), reference))
+
+    fit <- fit_ml_poisson(
+      data = data_tmp,
+      outcome = outcome,
+      formula_rhs = var,
+      needed_vars = var
+    )
+
+    tidy_ml_poisson(
+      fit = fit,
+      outcome_label = outcome_label,
+      model_type = "UPR",
+      model_label = label
+    ) %>%
+      mutate(
+        exposure_label = label,
+        exposure_var = var,
+        exposure_type = "SES",
+        .after = model_label
+      )
+  })
+
+cat("Unadjusted models completed.\n")
+cat("Unadjusted PR estimates:", nrow(obj2_upr_results), "\n")
+```
+
+# Sequential Adjusted Models
+
+Three models are fitted for each outcome and SES marker:
+
+- Model 1: SES marker only
+- Model 2: SES marker + age + sex + marital status + subjective income feeling
+- Model 3: Model 2 + survey year
+
+```{r define-sequential-models}
+sequential_models <- tribble(
+  ~model_num, ~model_name, ~formula_components,
+  1, "M1: SES only", "ses_var",
+  2, "M2: SES + covariates", "ses_var + agea + sex + marital + income_feeling",
+  3, "M3: SES + covariates + survey year", "ses_var + agea + sex + marital + income_feeling + survey_year"
+)
+
+sequential_models
+```
+
+```{r sequential-models}
+obj2_sequential_fits <- list()
+obj2_sequential_results_list <- list()
+
+for (i in seq_len(nrow(obj2_outcomes))) {
+  outcome <- obj2_outcomes$outcome[i]
+  outcome_label <- obj2_outcomes$outcome_label[i]
+
+  cat("Processing outcome:", outcome_label, "\n")
+
+  outcome_results <- pmap_dfr(
+    obj2_ses,
+    function(var, label, reference) {
+      data_tmp <- ess_ml_data %>%
+        mutate("{var}" := fct_relevel(factor(.data[[var]]), reference))
+
+      fits_list <- map(
+        seq_len(nrow(sequential_models)),
+        function(m) {
+          formula_rhs <- str_replace(
+            sequential_models$formula_components[m],
+            "ses_var",
+            var
+          )
+          needed_vars <- str_split(formula_rhs, " \\+ ")[[1]]
+
+          fit_ml_poisson(
+            data = data_tmp,
+            outcome = outcome,
+            formula_rhs = formula_rhs,
+            needed_vars = needed_vars
+          )
+        }
+      )
+
+      key <- paste(outcome, var, sep = "_")
+      obj2_sequential_fits[[key]] <<- list(
+        outcome = outcome,
+        outcome_label = outcome_label,
+        exposure_var = var,
+        exposure_label = label,
+        exposure_type = "SES",
+        reference = reference,
+        fits = fits_list
+      )
+
+      pmap_dfr(
+        tibble(model_num = sequential_models$model_num, fit = fits_list),
+        function(model_num, fit) {
+          tidy_ml_poisson(
+            fit = fit,
+            outcome_label = outcome_label,
+            model_type = "Sequential",
+            model_label = sequential_models$model_name[model_num]
+          ) %>%
+            mutate(
+              exposure_label = label,
+              exposure_var = var,
+              exposure_type = "SES",
+              model_num = model_num
+            )
+        }
+      )
+    }
+  )
+
+  obj2_sequential_results_list[[i]] <- outcome_results
+  gc(verbose = FALSE)
+}
+
+obj2_sequential_results <- bind_rows(obj2_sequential_results_list)
+
+cat("Sequential models completed.\n")
+cat("Estimates extracted:", nrow(obj2_sequential_results), "\n")
+cat("Outcome-SES combinations stored:", length(obj2_sequential_fits), "\n")
+```
+
+# Model Comparison
+
+AIC and BIC are compared across sequential models for each outcome and SES marker. The final adjusted table uses the lowest-AIC model. BIC is retained as a secondary model-comparison statistic.
+
+```{r model-comparison}
+model_comparison_results <- map_dfr(
+  obj2_sequential_fits,
+  function(entry) {
+    tibble(
+      Outcome = entry$outcome_label,
+      SES_model = entry$exposure_label,
+      SES_variable = entry$exposure_var,
+      Model = sequential_models$model_name,
+      Model_num = sequential_models$model_num,
+      AIC = map_dbl(entry$fits, ~ if (is.null(.x)) NA_real_ else AIC(.x)),
+      BIC = map_dbl(entry$fits, ~ if (is.null(.x)) NA_real_ else BIC(.x)),
+      LogLik = map_dbl(entry$fits, ~ if (is.null(.x)) NA_real_ else as.numeric(logLik(.x)))
+    ) %>%
+      filter(!is.na(AIC)) %>%
+      mutate(
+        Delta_AIC = AIC - min(AIC, na.rm = TRUE),
+        Delta_BIC = BIC - min(BIC, na.rm = TRUE),
+        Best_AIC = Delta_AIC == 0,
+        Best_BIC = Delta_BIC == 0
+      )
+  }
+)
+
+model_comparison_results %>%
+  select(Outcome, SES_model, Model, AIC, BIC, Delta_AIC, Delta_BIC) %>%
+  arrange(Outcome, SES_model, Delta_AIC)
+```
+
+```{r best-models}
+best_models <- model_comparison_results %>%
+  group_by(Outcome, SES_model, SES_variable) %>%
+  filter(Delta_AIC == min(Delta_AIC, na.rm = TRUE)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(
+    Outcome,
+    SES_model,
+    SES_variable,
+    Model,
+    Model_num,
+    AIC,
+    BIC,
+    Delta_AIC,
+    Delta_BIC
+  )
+
+best_models %>%
+  arrange(Outcome, SES_model) %>%
+  knitr::kable(digits = 2)
+```
+
+# Final Adjusted Results
+
+```{r extract-final-results}
+obj2_final_results <- pmap_dfr(
+  best_models,
+  function(Outcome, SES_model, SES_variable, Model, Model_num, ...) {
+    outcome_var <- obj2_outcomes %>%
+      filter(outcome_label == Outcome) %>%
+      pull(outcome) %>%
+      first()
+
+    ses_reference <- obj2_ses %>%
+      filter(var == SES_variable) %>%
+      pull(reference) %>%
+      first()
+
+    formula_rhs <- str_replace(
+      sequential_models$formula_components[Model_num],
+      "ses_var",
+      SES_variable
+    )
+    needed_vars <- str_split(formula_rhs, " \\+ ")[[1]]
+
+    data_tmp <- ess_ml_data %>%
+      mutate(
+        "{SES_variable}" := fct_relevel(
+          factor(.data[[SES_variable]]),
+          ses_reference
+        )
+      )
+
+    fit <- fit_ml_poisson(
+      data = data_tmp,
+      outcome = outcome_var,
+      formula_rhs = formula_rhs,
+      needed_vars = needed_vars
+    )
+
+    tidy_ml_poisson(
+      fit = fit,
+      outcome_label = Outcome,
+      model_type = "APR",
+      model_label = SES_model
+    ) %>%
+      mutate(
+        exposure_label = SES_model,
+        exposure_var = SES_variable,
+        exposure_type = "SES",
+        selected_model = Model,
+        selected_model_num = Model_num
+      )
+  }
+)
+
+cat("Final adjusted model results extracted.\n")
+cat("Adjusted PR estimates:", nrow(obj2_final_results), "\n")
+```
+
+# Results Table
+
+Only SES exposure terms are shown in the main results table. Age, sex, marital status, subjective income feeling, and survey year are adjustment variables where included by the selected model.
+
+```{r build-results-table}
+obj2_upr_decoded <- obj2_upr_results %>%
+  keep_exposure_terms()
+
+obj2_final_decoded <- obj2_final_results %>%
+  keep_exposure_terms()
+
+upr_wide <- obj2_upr_decoded %>%
+  select(Outcome, Variable, Level, PR_CI, p_fmt) %>%
+  rename(
+    `UPR (95% CI)` = PR_CI,
+    `UPR p-value` = p_fmt
+  )
+
+apr_wide <- obj2_final_decoded %>%
+  select(Outcome, model_label, Variable, Level, PR_CI, p_fmt, selected_model) %>%
+  rename(
+    `SES Model` = model_label,
+    `APR (95% CI)` = PR_CI,
+    `APR p-value` = p_fmt,
+    `Selected model` = selected_model
+  )
+
+obj2_combined_table <- apr_wide %>%
+  left_join(
+    upr_wide,
+    by = c("Outcome", "Variable", "Level")
+  ) %>%
+  select(
+    Outcome,
+    `SES Model`,
+    Variable,
+    Level,
+    `UPR (95% CI)`,
+    `UPR p-value`,
+    `APR (95% CI)`,
+    `APR p-value`,
+    `Selected model`
+  )
+
+reference_rows <- crossing(
+  Outcome = obj2_outcomes$outcome_label,
+  obj2_ses
+) %>%
+  transmute(
+    Outcome = Outcome,
+    `SES Model` = label,
+    Variable = label,
+    Level = reference,
+    `UPR (95% CI)` = "1.00 (Reference)",
+    `UPR p-value` = "-",
+    `APR (95% CI)` = "1.00 (Reference)",
+    `APR p-value` = "-",
+    `Selected model` = NA_character_
+  )
+
+obj2_final_table <- bind_rows(reference_rows, obj2_combined_table) %>%
+  mutate(
+    Outcome = factor(
+      Outcome,
+      levels = obj2_outcomes$outcome_label
+    ),
+    Variable = factor(
+      Variable,
+      levels = obj2_ses$label
+    ),
+    level_order = case_when(
+      Variable == "Education level" & Level == "High" ~ 1,
+      Variable == "Education level" & Level == "Medium" ~ 2,
+      Variable == "Education level" & Level == "Low" ~ 3,
+      Variable == "Household income" & Level == "High" ~ 1,
+      Variable == "Household income" & Level == "Middle" ~ 2,
+      Variable == "Household income" & Level == "Low" ~ 3,
+      Variable == "Employment status" & Level == "Employed" ~ 1,
+      Variable == "Employment status" & Level == "Inactive (other)" ~ 2,
+      Variable == "Employment status" & Level == "Retired" ~ 3,
+      Variable == "Employment status" & Level == "Unemployed" ~ 4,
+      Variable == "Occupational class" & Level == "Non-manual (higher)" ~ 1,
+      Variable == "Occupational class" & Level == "Non-manual (lower)" ~ 2,
+      Variable == "Occupational class" & Level == "Manual" ~ 3,
+      TRUE ~ 99
+    )
+  ) %>%
+  arrange(Outcome, Variable, level_order) %>%
+  select(-level_order) %>%
+  group_by(Outcome, `SES Model`) %>%
+  mutate(`SES Model` = if_else(row_number() == 1, as.character(`SES Model`), "")) %>%
+  ungroup()
+
+obj2_final_table
+```
+
+```{r display-final-table}
+obj2_final_table %>%
+  gt(groupname_col = "Outcome") %>%
+  tab_header(
+    title = md("**Table. Socioeconomic Inequalities in Smoking Outcomes**"),
+    subtitle = md(
+      "*Unadjusted and adjusted prevalence ratios from multilevel Poisson models*"
+    )
+  ) %>%
+  cols_label(
+    `SES Model` = "SES marker",
+    Variable = "Variable",
+    Level = "Level",
+    `UPR (95% CI)` = "UPR (95% CI)",
+    `UPR p-value` = "UPR p",
+    `APR (95% CI)` = "APR (95% CI)",
+    `APR p-value` = "APR p",
+    `Selected model` = "Selected model"
+  ) %>%
+  cols_align(
+    align = "left",
+    columns = c(`SES Model`, Variable, Level, `Selected model`)
+  ) %>%
+  cols_align(
+    align = "center",
+    columns = c(`UPR (95% CI)`, `UPR p-value`, `APR (95% CI)`, `APR p-value`)
+  ) %>%
+  tab_options(
+    table.width = pct(100),
+    table.font.size = px(11),
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(12),
+    column_labels.font.weight = "bold",
+    row_group.font.weight = "bold",
+    row_group.background.color = "#F0F0F0",
+    data_row.padding = px(4)
+  ) %>%
+  tab_source_note(
+    md(
+      paste(
+        "*UPR = unadjusted prevalence ratio;",
+        "APR = adjusted prevalence ratio.",
+        "All models include a random intercept for country and use `anweight`.",
+        "Subjective income feeling is included as a covariate in adjusted models, not as an SES exposure.",
+        "Reference categories are shown as 1.00.*"
+      )
+    )
+  )
+```
+
+# Optional Sensitivity Analysis: Survey Year Interactions
+
+Use this section if the study needs to test whether socioeconomic inequalities changed between 2014 and 2023.
+
+```{r survey-year-interactions, eval=FALSE}
+interaction_results <- pmap_dfr(
+  crossing(obj2_outcomes, obj2_ses),
+  function(outcome, outcome_label, var, label, reference) {
+    data_tmp <- ess_ml_data %>%
+      mutate("{var}" := fct_relevel(factor(.data[[var]]), reference))
+
+    formula_rhs <- paste0(
+      var,
+      " * survey_year + agea + sex + marital + income_feeling"
+    )
+    needed_vars <- c(var, "survey_year", "agea", "sex", "marital", "income_feeling")
+
+    fit <- fit_ml_poisson(
+      data = data_tmp,
+      outcome = outcome,
+      formula_rhs = formula_rhs,
+      needed_vars = needed_vars
+    )
+
+    tidy_ml_poisson(
+      fit = fit,
+      outcome_label = outcome_label,
+      model_type = "Interaction",
+      model_label = label
+    ) %>%
+      filter(str_detect(term_raw, ":")) %>%
+      mutate(
+        exposure_label = label,
+        exposure_var = var
+      )
+  }
+)
+
+interaction_results
+```
+
+# Diagnostics Template
+
+```{r diagnostics-template, eval=FALSE}
+fit_example <- obj2_sequential_fits[["Daily_smoker_education"]]$fits[[3]]
+
+if (!is.null(fit_example)) {
+  AIC(fit_example)
+  summary(fit_example)
+  ranef(fit_example)
+}
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```

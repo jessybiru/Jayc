@@ -1,0 +1,447 @@
+---
+title: "Prevalance of Smoking Outcomes across social economic groups"
+subtitle: "European Social Survey, 2014 and 2023"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message=FALSE, warning=FALSE)
+```
+
+# Objective 1: Prevalence of Smoking Outcomes Across Socioeconomic Groups (2014 & 2023)
+
+Objective 1 described the prevalence of daily smoking across socioeconomic groups in 2014 and 2023. The analysis focused on education and household income as the primary socioeconomic indicators. Education was grouped into high, medium, and low categories, while household income was grouped into high, middle, low, and missing-income categories. The missing-income category was retained to preserve the analytical sample and to allow comparability with later regression models. Survey-weighted prevalence estimates were calculated separately by survey year for each socioeconomic group using the ESS analysis weight. Results were presented as weighted percentages with 95% confidence intervals, alongside unweighted counts. Differences in prevalence between 2014 and 2023 were described visually using tables and plots, but no regression adjustment was applied in Objective 1 because the aim was descriptive rather than inferential.
+
+## Setup for Objective 1
+
+This chunk loads the packages and re-creates the survey design object. The four binary/categorical smoking outcomes are relabelled so that tables display readable event categories. We use `anweight` so all prevalence estimates are survey-weighted.
+
+```{r obj1-setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(rlang)
+library(srvyr)
+library(gt)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(tidytext)
+library(scales)
+library(grid)
+```
+
+
+Loading the Clean Data set
+```{r Loading the  data set}
+ess_clean <- readRDS("ess_clean.rds")
+
+```
+
+Building the survey design with labelled outcomes
+```{r }
+
+ess_survey <- ess_clean %>%
+  mutate(
+    daily_smoker = factor(daily_smoker, levels = c(0, 1), labels = c("No", "Yes")),
+    current_smoking = factor(current_smoking, levels = c(0, 1), labels = c("No", "Yes")),
+    ever_smoking = factor(ever_smoking, levels = c(0, 1), labels = c("No", "Yes")),
+    daily_10plus_smoker = factor(daily_10plus_smoker, levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  as_survey_design(weights = anweight)
+```
+
+
+## Define outcomes and socioeconomic markers
+
+This chunk lists the four smoking outcomes (with the category that counts as the "event") and the four socioeconomic markers that define the groups. Keeping these as small lookup tables lets us loop over every outcome × marker combination.
+
+```{r variable definitions}
+# Smoking outcomes: variable, the "event" level, and a clean label
+obj1_outcomes <- tibble::tribble(
+  ~variable,                ~event, ~Outcome,
+  "daily_smoker",           "Yes",  "Daily smoking",
+ 
+)
+
+# Socioeconomic markers: variable name and clean label
+obj1_ses <- c(
+  education = "Education level",
+  income_group_missing = "Household income group"
+)
+```
+
+## Prevalence estimation helper function
+
+This helper estimates survey-weighted prevalence and 95% confidence intervals for one smoking outcome across one socioeconomic marker, separately by survey year. Counts are unweighted.
+
+```{r helper_function}
+
+prevalence_by_ses <- function(design, outcome, event, outcome_label,
+                              ses_var, ses_label) {
+  design %>%
+    filter(
+      !is.na(!!sym(outcome)),
+      !is.na(!!sym(ses_var))
+    ) %>%
+    group_by(
+      survey_year,
+      !!sym(ses_var)
+    ) %>%
+    summarise(
+      n = unweighted(n()),
+      prevalence = survey_mean(
+        !!sym(outcome) == event,
+        vartype = "ci",
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      prevalence = prevalence * 100,
+      prevalence_low = prevalence_low * 100,
+      prevalence_upp = prevalence_upp * 100
+    ) %>%
+    rename(SES_group = !!sym(ses_var)) %>%
+    mutate(
+      Outcome = outcome_label,
+      SES_marker = ses_label,
+      SES_group = as.character(SES_group),
+      survey_year = as.character(survey_year),
+      .before = 1
+    )
+}
+
+```
+
+
+
+## Compute prevalence for the outcome × socioeconomic markers
+
+This chunk applies the prevalence helper to the selected smoking outcome and the two primary socioeconomic markers: education and household income.
+
+
+```{r prevalance}
+
+   obj1_results <- pmap_dfr(
+  obj1_outcomes,
+  function(variable, event, Outcome) {
+    imap_dfr(
+      obj1_ses,
+      function(ses_label, ses_var) {
+        prevalence_by_ses(
+          design = ess_survey,
+          outcome = variable,
+          event = event,
+          outcome_label = Outcome,
+          ses_var = ses_var,
+          ses_label = ses_label
+        )
+      }
+    )
+  }
+) %>%
+  mutate(
+    Outcome = factor(Outcome, levels = obj1_outcomes$Outcome),
+    SES_marker = factor(SES_marker, levels = obj1_ses)
+  )
+
+obj1_results
+```
+
+
+## Publication table: prevalence by socioeconomic group and wave
+
+This chunk reshapes the prevalence results so that 2014 and 2023 appear side by side.
+
+```{r obj1-table}
+obj1_table_wide <- obj1_results %>%
+  mutate(
+    estimate = sprintf(
+      "%.1f (%.1f-%.1f)",
+      prevalence,
+      prevalence_low,
+      prevalence_upp
+    )
+  ) %>%
+  select(
+    Outcome,
+    SES_marker,
+    SES_group,
+    survey_year,
+    n,
+    estimate
+  ) %>%
+  pivot_wider(
+    id_cols = c(Outcome, SES_marker, SES_group),
+    names_from = survey_year,
+    values_from = c(n, estimate),
+    names_glue = "{survey_year}_{.value}"
+  )
+
+obj1_table_wide
+```
+This chunk formats the weighted prevalence table for Objective 1.
+
+```{r obj1-gt-tables}
+obj1_table_wide %>%
+  filter(Outcome == "Daily smoking") %>%
+  select(-Outcome) %>%
+  gt(
+    groupname_col = "SES_marker",
+    rowname_col = "SES_group"
+  ) %>%
+  tab_header(
+    title = md("**Weighted prevalence of daily smoking across socioeconomic groups**"),
+    subtitle = md("*European Social Survey, 2014 and 2023*")
+  ) %>%
+  tab_spanner(label = md("**2014**"), columns = starts_with("2014")) %>%
+  tab_spanner(label = md("**2023**"), columns = starts_with("2023")) %>%
+  cols_label(
+    `2014_n` = "n",
+    `2014_estimate` = "% (95% CI)",
+    `2023_n` = "n",
+    `2023_estimate` = "% (95% CI)"
+  ) %>%
+  fmt_number(columns = ends_with("_n"), decimals = 0, use_seps = TRUE) %>%
+  sub_missing(missing_text = "-") %>%
+  cols_align(align = "right", columns = ends_with("_n")) %>%
+  cols_align(align = "center", columns = ends_with("_estimate")) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.width = pct(100),
+    row_group.font.weight = "bold",
+    row_group.background.color = "grey95",
+    table.font.size = px(13),
+    heading.title.font.size = px(15),
+    column_labels.font.weight = "bold",
+    data_row.padding = px(3)
+  ) %>%
+  tab_source_note(
+    md("*Prevalence is survey-weighted using `anweight`; n is unweighted. Household income includes a separate missing-income category.*")
+  )
+```
+
+
+
+#Prevalance Heatmap
+This chunk produces a heat map  summarizing the prevalence of daily smoking by each of the Markers 
+
+```{r obj1-joint-prevalence-heatmap, fig.width=13, fig.height=8.8, warning=FALSE, message=FALSE}
+
+
+ses_rank <- tibble::tribble(
+  ~SES_marker,              ~SES_group,       ~rank,
+
+  "Education level",        "High",           1,
+  "Education level",        "Medium",         2,
+  "Education level",        "Low",            3,
+
+  "Household income group", "High",           1,
+  "Household income group", "Middle",         2,
+  "Household income group", "Low",            3,
+  "Household income group", "Missing income", 4
+)
+
+obj1_heatmap_data <- obj1_results %>%
+  filter(
+    Outcome == "Daily smoking",
+    SES_marker %in% c("Education level", "Household income group")
+  ) %>%
+  left_join(ses_rank, by = c("SES_marker", "SES_group")) %>%
+  filter(!is.na(rank)) %>%
+  mutate(
+    SES_marker = factor(
+      SES_marker,
+      levels = c("Education level", "Household income group")
+    ),
+    SES_group_ordered = tidytext::reorder_within(
+      SES_group,
+      -rank,
+      SES_marker
+    ),
+    survey_year = factor(survey_year, levels = c("2014", "2023")),
+    prevalence_label = sprintf("%.1f", prevalence),
+    label_colour = if_else(prevalence >= 40, "white", "black")
+  )
+
+
+ggplot(
+  obj1_heatmap_data,
+  aes(
+    x = survey_year,
+    y = SES_group_ordered,
+    fill = prevalence
+  )
+) +
+  geom_tile(
+    colour = "white",
+    linewidth = 1,
+    width = 0.92,
+    height = 0.88
+  ) +
+  geom_text(
+    aes(label = prevalence_label, colour = label_colour),
+    size = 3.4
+  ) +
+  facet_grid(
+    SES_marker ~ .,
+    scales = "free_y",
+    space = "free_y",
+    switch = "y"
+  ) +
+  tidytext::scale_y_reordered() +
+  scale_colour_identity() +
+  scale_fill_gradient(
+    low = "#F7F7F7",
+    high = "#B2182B",
+    name = "Weighted prevalence (%)"
+  ) +
+  labs(
+    title = "Weighted daily smoking prevalence across socioeconomic groups",
+    #subtitle = "European Social Survey, 2014 and 2023",
+    x = NULL,
+    y = NULL,
+    caption = "Cells show survey-weighted prevalence percentages using anweight."
+  ) +
+  theme_minimal(base_size = 11) +
+ 
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 8.5, hjust = 0),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(
+      angle = 0,
+      face = "bold",
+      size = 11,
+      hjust = 1
+    ),
+    axis.text.x = element_text(size = 10, colour = "black"),
+    axis.text.y = element_text(size = 10, colour = "black"),
+    panel.grid = element_blank(),
+    panel.spacing.y = unit(1.0, "lines"),
+    legend.position = "bottom"
+  )
+
+```
+The heatmap shows weighted daily smoking prevalence across education and household income groups in 2014 and 2023. Daily smoking prevalence declined between 2014 and 2023 across most socioeconomic groups. A socioeconomic gradient was evident. Respondents with high education and high household income had lower daily smoking prevalence than those with lower education or lower household income. The missing income group had intermediate smoking prevalence, supporting its retention as a separate category in descriptive and regression analyses.
+
+
+
+
+
+## Sensitivity analysis 
+
+If we do not keep missing income as its own group, and instead impute it into Low/Middle/High, do we still see the same income gradient?
+
+### Load imputed dataset for sensitivity analysis
+
+This chunk loads the long-format imputed dataset. The original dataset is `.imp = 0`; imputed datasets are `.imp = 1` to `.imp = 10`.
+```{r load-imputed-data}
+
+ess_imputed_long <- readRDS("ess_imputed_long.rds")
+
+ess_imputed_analysis <- ess_imputed_long %>%
+  filter(.imp > 0)
+```
+
+### Estimate Prevalence Across Imputations
+
+This chunk estimates weighted daily smoking prevalence by imputed household income group in each imputed dataset, then averages the prevalence estimates across imputations.
+
+```{r}
+income_prevalence_imputed <- ess_imputed_analysis %>%
+  mutate(
+    survey_year = as.character(survey_year),
+    daily_smoker = factor(daily_smoker, levels = c(0, 1), labels = c("No", "Yes")),
+    income_group = factor(income_group, levels = c("Low", "Middle", "High"))
+  ) %>%
+  group_by(.imp, survey_year, income_group) %>%
+  summarise(
+    n = n(),
+    weighted_prevalence = weighted.mean(
+      daily_smoker == "Yes",
+      w = anweight,
+      na.rm = TRUE
+    ) * 100,
+    .groups = "drop"
+  ) %>%
+  group_by(survey_year, income_group) %>%
+  summarise(
+    mean_n = round(mean(n, na.rm = TRUE), 0),
+    mean_prevalence = mean(weighted_prevalence, na.rm = TRUE),
+    lower = quantile(weighted_prevalence, 0.025, na.rm = TRUE),
+    upper = quantile(weighted_prevalence, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    estimate = sprintf(
+      "%.1f (%.1f-%.1f)",
+      mean_prevalence,
+      lower,
+      upper
+    )
+  )
+
+income_prevalence_imputed
+```
+
+### Imputed income sensitivity table
+
+This chunk formats the imputed-income sensitivity analysis as a table.
+
+```{r}
+income_prevalence_imputed_wide <- income_prevalence_imputed %>%
+  select(income_group, survey_year, mean_n, estimate) %>%
+  pivot_wider(
+    id_cols = income_group,
+    names_from = survey_year,
+    values_from = c(mean_n, estimate),
+    names_glue = "{survey_year}_{.value}"
+  )
+
+income_prevalence_imputed_wide %>%
+  gt(rowname_col = "income_group") %>%
+  tab_header(
+    title = md("** Prevalance of daily smoking by imputed household income**"),
+   #subtitle = md("*Weighted prevalence averaged across imputed datasets*")
+  ) %>%
+  
+  
+  tab_spanner(label = md("**2014**"), columns = starts_with("2014")) %>%
+  tab_spanner(label = md("**2023**"), columns = starts_with("2023")) %>%
+  cols_label(
+    `2014_mean_n` = "Mean n",
+    `2014_estimate` = "% (interval)",
+    `2023_mean_n` = "Mean n",
+    `2023_estimate` = "% (interval)"
+  ) %>%
+  
+  
+  fmt_number(columns = ends_with("mean_n"), decimals = 0, use_seps = TRUE) %>%
+  cols_align(align = "right", columns = ends_with("mean_n")) %>%
+  cols_align(align = "center", columns = ends_with("estimate")) %>%
+  tab_stubhead(label = md("**Income group**")) %>%
+  tab_options(
+    table.width = pct(100),
+    table.font.size = px(13),
+    heading.title.font.size = px(15),
+    column_labels.font.weight = "bold",
+    data_row.padding = px(3)
+  ) %>%
+  tab_source_note(
+    md("*Prevalence was estimated separately in each imputed dataset and averaged across imputations. The interval shows the 2.5th and 97.5th percentiles of estimates across imputations, not a formal confidence interval.*")
+  )
+```
+
+
+The primary analysis retained missing household income as a separate category. In this analysis, daily smoking prevalence was highest among low-income respondents and lowest among high-income respondents in both survey years. Respondents with missing income had intermediate smoking prevalence.
+
+As a sensitivity analysis, household income was multiply imputed and daily smoking prevalence was recalculated across imputed income groups. The imputed analysis produced a similar income gradient: daily smoking remained highest in the low-income group and lowest in the high-income group in both 2014 and 2023. This suggests that the observed income gradient was robust to the handling of missing household income.
+
